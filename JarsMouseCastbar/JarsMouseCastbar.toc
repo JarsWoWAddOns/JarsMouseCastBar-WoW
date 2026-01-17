@@ -1,0 +1,8 @@
+## Interface: 120000
+## Title: Jar's Mouse Castbar
+## Notes: Castbar attached to mouse cursor
+## Author: Jar
+## Version: 1.0.0
+## SavedVariables: JarsMouseCastbarDB
+
+JarsMouseCastbar.lua
