@@ -12,7 +12,7 @@ See it in action here in combination with my Jar's Mouse Action Bar Addon.
 * Scale the bar `length` 
 * Scale the bar `width`
 * Offset the X and Y relationship to the mouse cursor.
-* Srt the bar style as Horizontal, Vertical, Or  Circular (Circular kinda sucks, atm).
+* Set the bar style as Horizontal, Vertical, Or  Circular (Circular kinda sucks, atm).
 * Show spell name, etc.
 
 If you set the Bar style for Vertical, than `length` and `width` essentiall flip 90 degrees. 
