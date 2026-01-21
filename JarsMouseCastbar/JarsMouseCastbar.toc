@@ -1,4 +1,4 @@
-## Interface: 120000
+## Interface: 120001, 120000
 ## Title: Jar's Mouse Castbar
 ## Notes: Castbar attached to mouse cursor
 ## Author: Jar
