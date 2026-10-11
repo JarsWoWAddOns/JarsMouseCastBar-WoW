@@ -9,32 +9,24 @@ local BAR_TEXTURES = {
     ["Minimalist"] = "Interface\\BUTTONS\\WHITE8X8",
 }
 
--- Initialize saved variables
+local DEFAULTS = {
+    barLength = 200,
+    barWidth = 24,
+    cursorOffsetX = 20,
+    cursorOffsetY = 20,
+    barStyle = "horizontal", -- "horizontal", "vertical", or "circular"
+    barTexture = "Blizzard",
+    showText = true,
+    circularRadius = 40,
+}
+
+-- Initialize saved variables, fill in any missing keys
 local function InitDB()
-    if not JarsMouseCastbarDB then
-        JarsMouseCastbarDB = {
-            barLength = 200,
-            barWidth = 24,
-            cursorOffsetX = 20,
-            cursorOffsetY = 20,
-            barStyle = "horizontal", -- "horizontal", "vertical", or "circular"
-            barTexture = "Blizzard",
-            showText = true,
-            circularRadius = 40,
-        }
-    end
-    -- Set defaults if missing
-    if not JarsMouseCastbarDB.barTexture then
-        JarsMouseCastbarDB.barTexture = "Blizzard"
-    end
-    if JarsMouseCastbarDB.showText == nil then
-        JarsMouseCastbarDB.showText = true
-    end
-    if not JarsMouseCastbarDB.barLength then
-        JarsMouseCastbarDB.barLength = 200
-    end
-    if not JarsMouseCastbarDB.barWidth then
-        JarsMouseCastbarDB.barWidth = 24
+    JarsMouseCastbarDB = JarsMouseCastbarDB or {}
+    for k, v in pairs(DEFAULTS) do
+        if JarsMouseCastbarDB[k] == nil then
+            JarsMouseCastbarDB[k] = v
+        end
     end
 end
 
@@ -44,6 +36,44 @@ local configFrame
 local isCasting = false
 local isChanneling = false
 local isEmpowering = false
+local isTesting = false
+local currentCastBarID  -- castBarID of what the bar is showing
+
+-- where castBarID sits in each payload (unit is 1), from UnitDocumentation
+local CASTBAR_ID_ARG = {
+    UNIT_SPELLCAST_STOP = 4,
+    UNIT_SPELLCAST_SUCCEEDED = 4,
+    UNIT_SPELLCAST_FAILED = 4,
+    UNIT_SPELLCAST_INTERRUPTED = 5,
+    UNIT_SPELLCAST_CHANNEL_STOP = 5,
+    UNIT_SPELLCAST_EMPOWER_STOP = 6,
+}
+
+local function GetEventCastBarID(event, ...)
+    local idx = CASTBAR_ID_ARG[event]
+    if idx then
+        return (select(idx, ...))
+    end
+end
+
+-- nil on either side = cant tell, so accept like before
+local function IsOurCast(castBarID)
+    return castBarID == nil or currentCastBarID == nil or castBarID == currentCastBarID
+end
+
+-- players own cast info isnt secret, so plain math is fine here
+local function ReadPlayerCast()
+    if isChanneling or isEmpowering then
+        local name, _, _, startTimeMS, endTimeMS = UnitChannelInfo("player")
+        if name and isEmpowering then
+            -- include the hold at max like blizz does
+            endTimeMS = endTimeMS + GetUnitEmpowerHoldAtMaxTime("player")
+        end
+        return name, startTimeMS, endTimeMS
+    end
+    local name, _, _, startTimeMS, endTimeMS = UnitCastingInfo("player")
+    return name, startTimeMS, endTimeMS
+end
 
 -- Create horizontal cast bar
 local function CreateHorizontalBar(parent)
@@ -187,27 +217,54 @@ local function CreateCircularBar(parent)
     return bar
 end
 
+-- Size the frame and swap to the bar for the current style.
+-- each style's bar is made once and reused
+local function ApplyLayout(frame)
+    local db = JarsMouseCastbarDB
+    -- Frame size will contain the bar plus some padding for text
+    local size = math.max(db.barLength, db.barWidth)
+    frame:SetSize(size + 20, size + 40)
+
+    local style = db.barStyle
+    if style ~= "vertical" and style ~= "circular" then
+        style = "horizontal"
+    end
+    if not frame.bars[style] then
+        if style == "vertical" then
+            frame.bars[style] = CreateVerticalBar(frame)
+        elseif style == "circular" then
+            frame.bars[style] = CreateCircularBar(frame)
+        else
+            frame.bars[style] = CreateHorizontalBar(frame)
+        end
+    end
+    for s, b in pairs(frame.bars) do
+        b:SetShown(s == style)
+    end
+
+    local bar = frame.bars[style]
+    if style ~= "circular" then
+        if style == "vertical" then
+            bar:SetSize(db.barWidth, db.barLength)
+        else
+            bar:SetSize(db.barLength, db.barWidth)
+        end
+        bar:SetStatusBarTexture(BAR_TEXTURES[db.barTexture] or BAR_TEXTURES["Blizzard"])
+        bar:GetStatusBarTexture():SetHorizTile(false)
+        bar:GetStatusBarTexture():SetVertTile(false)
+    end
+    frame.bar = bar
+end
+
 -- Create main cast bar frame
 local function CreateCastFrame()
     local frame = CreateFrame("Frame", "JMCB_CastFrame", UIParent)
-    -- Frame size will contain the bar plus some padding for text
-    local frameWidth = math.max(JarsMouseCastbarDB.barLength, JarsMouseCastbarDB.barWidth) + 20
-    local frameHeight = math.max(JarsMouseCastbarDB.barLength, JarsMouseCastbarDB.barWidth) + 40
-    frame:SetSize(frameWidth, frameHeight)
     frame:SetFrameStrata("HIGH")
-    
-    -- Create bar based on style
-    local barStyle = JarsMouseCastbarDB.barStyle or "horizontal"
-    if barStyle == "vertical" then
-        frame.bar = CreateVerticalBar(frame)
-    elseif barStyle == "circular" then
-        frame.bar = CreateCircularBar(frame)
-    else
-        frame.bar = CreateHorizontalBar(frame)
-    end
-    
+    frame.bars = {}
+    ApplyLayout(frame)
+
     frame:Hide()
-    
+
     -- Frame follows cursor
     frame._lastX = 0
     frame._lastY = 0
@@ -215,22 +272,12 @@ local function CreateCastFrame()
         -- Update cast progress
         if isCasting or isChanneling or isEmpowering then
             local currentTime = GetTime()
-            local startTime, endTime, spellName
+            local startTime, endTime
 
-            if isCasting or isEmpowering then
-                local name, text, texture, startTimeMS, endTimeMS = UnitCastingInfo("player")
-                if name then
-                    spellName = name
-                    startTime = startTimeMS / 1000
-                    endTime = endTimeMS / 1000
-                end
-            elseif isChanneling then
-                local name, text, texture, startTimeMS, endTimeMS = UnitChannelInfo("player")
-                if name then
-                    spellName = name
-                    startTime = startTimeMS / 1000
-                    endTime = endTimeMS / 1000
-                end
+            local spellName, startTimeMS, endTimeMS = ReadPlayerCast()
+            if spellName then
+                startTime = startTimeMS / 1000
+                endTime = endTimeMS / 1000
             end
 
             if startTime and endTime and spellName then
@@ -264,6 +311,7 @@ local function CreateCastFrame()
                 isCasting = false
                 isChanneling = false
                 isEmpowering = false
+                currentCastBarID = nil
             end
         end
         
@@ -288,34 +336,28 @@ local function CreateCastFrame()
     return frame
 end
 
--- Recreate cast frame with new settings
+-- Re-apply settings to the existing frame, no more rebuilding
 local function RecreateCastFrame()
-    -- Preserve state
-    local wasShown = castFrame and castFrame:IsShown()
-    local wasCasting = isCasting
-    local wasChanneling = isChanneling
-    
-    -- Destroy old frame
+    -- -- Preserve state
+    -- local wasShown = castFrame and castFrame:IsShown()
+    -- local wasCasting = isCasting
+    -- local wasChanneling = isChanneling
+    -- if castFrame then
+    --     castFrame:Hide()
+    --     castFrame:SetScript("OnUpdate", nil)
+    --     castFrame = nil
+    -- end
+    -- castFrame = CreateCastFrame()
     if castFrame then
-        castFrame:Hide()
-        castFrame:SetScript("OnUpdate", nil)
-        castFrame = nil
-    end
-    
-    -- Create new frame
-    castFrame = CreateCastFrame()
-    
-    -- Restore state if needed
-    if wasShown and (wasCasting or wasChanneling) then
-        castFrame:Show()
+        ApplyLayout(castFrame)
     end
 end
 
 -- Start casting
 local function StartCasting()
     if not castFrame then return end
-    
-    local name, text, texture, startTimeMS, endTimeMS = UnitCastingInfo("player")
+
+    local name, _, _, startTimeMS, endTimeMS, _, _, _, _, castBarID = UnitCastingInfo("player")
     if name then
         -- Check if spell actually has a cast time (not instant)
         local duration = (endTimeMS - startTimeMS) / 1000
@@ -323,6 +365,9 @@ local function StartCasting()
             -- Only show cast bar for spells with cast time
             isCasting = true
             isChanneling = false
+            isEmpowering = false
+            isTesting = false
+            currentCastBarID = castBarID
             castFrame.bar:SetStatusBarColor(1, 0.7, 0, 1) -- Yellow/gold for casts
             castFrame:Show()
         end
@@ -330,38 +375,36 @@ local function StartCasting()
     end
 end
 
--- Start channeling
+-- Start channeling, empowers are channels too so this handles both
 local function StartChanneling()
     if not castFrame then return end
-    
-    -- Use C_Timer to delay the check slightly, channels may not have data immediately
-    C_Timer.After(0.05, function()
-        local name = UnitChannelInfo("player")
-        if name then
+
+    -- C_Timer.After(0.05, function()
+    -- channel info is there right at CHANNEL_START, no need to wait
+    local name, _, _, _, _, _, _, _, isEmpowered, _, castBarID = UnitChannelInfo("player")
+    if name then
+        isCasting = false
+        isTesting = false
+        currentCastBarID = castBarID
+        if isEmpowered then
+            isEmpowering = true
+            isChanneling = false
+            castFrame.bar:SetStatusBarColor(0.3, 0.8, 1, 1) -- Light blue for empowered
+        else
             isChanneling = true
-            isCasting = false
+            isEmpowering = false
             castFrame.bar:SetStatusBarColor(0.2, 0.6, 1, 1) -- Blue for channels
-            castFrame:Show()
         end
-    end)
+        castFrame:Show()
+    end
 end
 
 -- Start empowered cast
-local function StartEmpowering()
-    if not castFrame then return end
-
-    local name, _, _, startTimeMS, endTimeMS = UnitCastingInfo("player")
-    if name then
-        local duration = (endTimeMS - startTimeMS) / 1000
-        if duration > 0 then
-            isEmpowering = true
-            isCasting = false
-            isChanneling = false
-            castFrame.bar:SetStatusBarColor(0.3, 0.8, 1, 1) -- Light blue for empowered
-            castFrame:Show()
-        end
-    end
-end
+-- local function StartEmpowering()
+--     local name, _, _, startTimeMS, endTimeMS = UnitCastingInfo("player")
+--     ... empowers come from UnitChannelInfo not UnitCastingInfo, so this never showed
+-- end
+local StartEmpowering = StartChanneling
 
 -- Stop casting/channeling
 local function StopCasting()
@@ -381,6 +424,7 @@ local function StopCasting()
     isCasting = false
     isChanneling = false
     isEmpowering = false
+    currentCastBarID = nil
 end
 
 -- Failed/interrupted cast
@@ -393,12 +437,18 @@ local function FailedCast()
         isCasting = false
         return
     end
-    
+
     -- Not channeling, show the failed cast state
     isEmpowering = false
     if castFrame and castFrame:IsShown() then
         castFrame.bar:SetStatusBarColor(1, 0, 0, 1) -- Red for failed
-        C_Timer.After(0.3, StopCasting)
+        -- dont kill a new cast that started in the 0.3s
+        local failedID = currentCastBarID
+        C_Timer.After(0.3, function()
+            if currentCastBarID == failedID then
+                StopCasting()
+            end
+        end)
     end
 end
 
@@ -781,10 +831,37 @@ local function CreateConfigFrame()
     testHeader:SetPoint("TOPLEFT", PAD_LEFT, NextY(26))
     testHeader:SetPoint("RIGHT", -PAD_LEFT, 0)
 
+    -- one test driver, reused. the old one set isCasting so the real
+    -- OnUpdate saw no cast and hid the bar right away
+    local testFrame = CreateFrame("Frame")
+    local testStart, testDuration = 0, 3.0
+    testFrame:SetScript("OnUpdate", function(self)
+        if not isTesting then
+            self:Hide()
+            return
+        end
+        local elapsed = GetTime() - testStart
+        local progress = elapsed / testDuration
+        if progress >= 1 then
+            progress = 1
+            self:Hide()
+            C_Timer.After(0.5, function()
+                if isTesting then
+                    isTesting = false
+                    castFrame:Hide()
+                end
+            end)
+        end
+        castFrame.bar:SetValue(progress)
+        if JarsMouseCastbarDB.showText then
+            castFrame.bar.timeText:SetText(string.format("%.1f", testDuration - elapsed))
+        end
+    end)
+    testFrame:Hide()
+
     local testBtn = CreateModernButton(content, "Test Castbar", 160, 28, function()
-        if castFrame then
-            isCasting = true
-            isChanneling = false
+        if castFrame and not (isCasting or isChanneling or isEmpowering) then
+            isTesting = true
             castFrame.bar:SetStatusBarColor(1, 0.7, 0, 1)
             if JarsMouseCastbarDB.showText then
                 castFrame.bar.text:SetText("Test Cast")
@@ -794,25 +871,8 @@ local function CreateConfigFrame()
             castFrame:Show()
 
             -- Animate test cast over 3 seconds
-            local startTime = GetTime()
-            local duration = 3.0
-            local testFrame = CreateFrame("Frame")
-            testFrame:SetScript("OnUpdate", function(self)
-                local elapsed = GetTime() - startTime
-                local progress = elapsed / duration
-                if progress >= 1 then
-                    progress = 1
-                    self:SetScript("OnUpdate", nil)
-                    C_Timer.After(0.5, function()
-                        isCasting = false
-                        castFrame:Hide()
-                    end)
-                end
-                castFrame.bar:SetValue(progress)
-                if JarsMouseCastbarDB.showText then
-                    castFrame.bar.timeText:SetText(string.format("%.1f", duration - elapsed))
-                end
-            end)
+            testStart = GetTime()
+            testFrame:Show()
         end
     end)
     testBtn:SetPoint("TOPLEFT", PAD_LEFT, NextY(36))
@@ -827,17 +887,23 @@ end
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_STOP")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_FAILED")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_UPDATE")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_START")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_STOP")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_UPDATE")
+local CAST_EVENTS = {
+    "UNIT_SPELLCAST_START",
+    "UNIT_SPELLCAST_STOP",
+    "UNIT_SPELLCAST_SUCCEEDED",
+    "UNIT_SPELLCAST_FAILED",
+    "UNIT_SPELLCAST_INTERRUPTED",
+    "UNIT_SPELLCAST_CHANNEL_START",
+    "UNIT_SPELLCAST_CHANNEL_STOP",
+    "UNIT_SPELLCAST_CHANNEL_UPDATE",
+    "UNIT_SPELLCAST_EMPOWER_START",
+    "UNIT_SPELLCAST_EMPOWER_STOP",
+    "UNIT_SPELLCAST_EMPOWER_UPDATE",
+}
+-- player only, skip everyone elses casts
+for _, event in ipairs(CAST_EVENTS) do
+    eventFrame:RegisterUnitEvent(event, "player")
+end
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -878,25 +944,31 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         end
     elseif event == "UNIT_SPELLCAST_EMPOWER_STOP" then
         local unit = ...
-        if unit == "player" then
+        if unit == "player" and IsOurCast(GetEventCastBarID(event, ...)) then
             StopCasting()
         end
     elseif event == "UNIT_SPELLCAST_EMPOWER_UPDATE" then
         local unit = ...
         if unit == "player" and isEmpowering then
-            local name = UnitCastingInfo("player")
+            -- local name = UnitCastingInfo("player")
+            local name = UnitChannelInfo("player")
             if not name then
                 StopCasting()
             end
         end
     elseif event == "UNIT_SPELLCAST_STOP" or event == "UNIT_SPELLCAST_SUCCEEDED" or event == "UNIT_SPELLCAST_CHANNEL_STOP" then
         local unit = ...
-        if unit == "player" then
+        -- instants and spam presses have a diff castBarID, leave our bar alone
+        if unit == "player" and IsOurCast(GetEventCastBarID(event, ...)) then
+            -- off gcd instant during a hardcast, STOP will come for the real one
+            if event == "UNIT_SPELLCAST_SUCCEEDED" and isCasting and UnitCastingInfo("player") then
+                return
+            end
             StopCasting()
         end
     elseif event == "UNIT_SPELLCAST_FAILED" or event == "UNIT_SPELLCAST_INTERRUPTED" then
         local unit = ...
-        if unit == "player" then
+        if unit == "player" and IsOurCast(GetEventCastBarID(event, ...)) then
             FailedCast()
         end
     end
@@ -916,5 +988,12 @@ SlashCmdList["JARSMOUSECASTBAR"] = function(msg)
         print("|cff00ff00Jar's Mouse Castbar|r Commands:")
         print("  /jmcb - Open configuration window")
         print("  /jmcb config - Open configuration window")
+    end
+end
+
+-- for JarsAddonConfig
+function JarsMouseCastbar_OpenConfig()
+    if configFrame then
+        configFrame:Show()
     end
 end
